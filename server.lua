@@ -1,315 +1,252 @@
 local QBCore = exports['qb-core']:GetCoreObject()
+local Config = Config or _G.Config or (function() return Config end)()
 
-local pedCooldowns = {} -- [pedNetId] = expiryTimestamp (epoch seconds)
-local playerRobCounts = {} -- [playerId] = consecutiveRobCount
-local playerCooldowns = {} -- [playerId] = expiryTimestamp (epoch seconds)
-local pendingAttempts = {} -- [src] = {pedNetId = <num>, ts = <os.time()>}
-local lastAttemptTime = {} -- [src] = epoch seconds for simple rate limit
+-- Server-side tracking
+local lastMedicUse = {} -- [citizenid] = os.time()
+local activeCalls = {} -- [citizenid] = { source = src, type = 'npc'|'ambulance', timestamp = os.time(), expires = os.time()+X, billed = false }
+local callCounts = {} -- rate-limiting per source: [source] = {count, windowStart}
 
-local function debug(...) if Config.Debug then print('[rob-npc][server]', ...) end end
-
-local function inCooldown(pedNet)
-    if not pedNet then return false end
-    local expires = pedCooldowns[pedNet]
-    if not expires then return false end
-    return expires > os.time()
+-- Whitelist helper for models
+local function isModelAllowed(name, allowedList)
+    if not name then return false end
+    for _, v in ipairs(allowedList or {}) do if tostring(v) == tostring(name) then return true end end
+    return false
 end
 
-local function countOnlineCops()
-    if not QBCore or not QBCore.Functions or not QBCore.Functions.GetPlayers then return 0 end
+-- Logging helper
+local function logEvent(msg)
+    print(('[jlee-aimedic] %s'):format(msg))
+    if Config.EnableLogging and Config.WebhookURL and Config.WebhookURL ~= '' then
+        local data = { content = msg }
+        PerformHttpRequest(Config.WebhookURL, function() end, 'POST', json.encode(data), { ['Content-Type'] = 'application/json' })
+    end
+end
+
+-- Count on-duty ambulance players
+local function countAmbulanceOnline()
     local players = QBCore.Functions.GetPlayers()
-    local cnt = 0
+    local count = 0
     for _, pid in ipairs(players) do
         local ply = QBCore.Functions.GetPlayer(pid)
-        if ply and ply.PlayerData and ply.PlayerData.job then
-            local job = ply.PlayerData.job
-            if job.name == (Config.PoliceJobName or 'police') then
-                if Config.RequirePoliceOnDuty then
-                    if job.onduty == true then
-                        cnt = cnt + 1
-                    end
-                else
-                    cnt = cnt + 1
-                end
+        if ply and ply.PlayerData and ply.PlayerData.job and ply.PlayerData.job.name == (Config.AmbulanceJobName or 'ambulance') then
+            if ply.PlayerData.job.onduty then
+                count = count + 1
             end
         end
     end
-    return cnt
+    return count
 end
 
--- Client signals an intent to start robbing a ped. Server records this briefly and rate-limits.
-RegisterNetEvent('jlee-robnpc:server:startAttempt', function(pedNetId)
-    local src = source
-    local Player = QBCore.Functions.GetPlayer(src)
-    if not Player then return end
-
-    pedNetId = tonumber(pedNetId)
-    if not pedNetId then return end
-
-    -- simple per-player rate limit: one attempt every 2 seconds
+-- Rate-limit check
+local function canMakeCall(src, cid)
+    local window = Config.CallerRateWindow or 60
+    local maxCalls = Config.CallerMaxCallsPerWindow or 3
+    local key = cid or tostring(src)
+    local data = callCounts[key]
     local now = os.time()
-    if lastAttemptTime[src] and (now - lastAttemptTime[src]) < 2 then
-        debug('startAttempt: rate limited for', src)
-        return
+    if not data or (now - (data.windowStart or 0)) > window then
+        callCounts[key] = { count = 1, windowStart = now }
+        return true
     end
-    lastAttemptTime[src] = now
+    if data.count >= maxCalls then return false end
+    data.count = data.count + 1
+    return true
+end
 
-    -- store pending attempt with timestamp; will be validated by the actual AttemptRob call
-    pendingAttempts[src] = { pedNetId = pedNetId, ts = now }
-    debug('Recorded pending attempt for', src, 'pedNetId=', pedNetId)
 
-    -- Dispatch alert to police when a robbery is started (configurable)
-    if Config.EnableDispatch then
-        debug('Dispatch enabled - sending alerts to police')
-
-        -- Only attempt external PS-Dispatch integration when explicitly set to 'ps-dispatch'.
-        -- Otherwise the built-in internal dispatch is used by default.
-        if Config.ExternalDispatch == 'ps-dispatch' then
-            local ok = false
-            local data = {
-                title = 'Robbery in progress',
-                coords = nil,
-                offender = src,
-                pedNetId = pedNetId,
-                priority = 2
-            }
-            -- Try common ps-dispatch event names
-            if pcall(function() TriggerEvent('ps-dispatch:send', data) end) then ok = true end
-            if not ok and pcall(function() TriggerEvent('ps-dispatch:call', data) end) then ok = true end
-            if ok then
-                debug('ps-dispatch handled the robbery dispatch')
-            else
-                debug('ps-dispatch not available; falling back to internal dispatch')
-            end
-        end
-
-        -- Internal fallback: send client event to police players (keeps previous logic)
-        for _, pid in ipairs(QBCore.Functions.GetPlayers() or {}) do
-            local ply = QBCore.Functions.GetPlayer(pid)
-            if ply and ply.PlayerData and ply.PlayerData.job then
-                local job = ply.PlayerData.job
-                if job.name == (Config.PoliceJobName or 'police') then
-                    if pid == src then
-                        debug('Skipping offender when sending dispatch:', pid)
-                    else
-                        if Config.RequirePoliceOnDuty then
-                            if job.onduty == true then
-                                debug('Sending dispatch to on-duty police player', pid)
-                                TriggerClientEvent('jlee-robnpc:client:dispatchAlert', pid, { offender = src, pedNetId = pedNetId })
-                            else
-                                debug('Skipping police player (not on duty):', pid)
-                            end
-                        else
-                            debug('Sending dispatch to police player', pid)
-                            TriggerClientEvent('jlee-robnpc:client:dispatchAlert', pid, { offender = src, pedNetId = pedNetId })
-                        end
-                    end
-                end
-            end
-        end
-    else
-        debug('Dispatch disabled in config')
-    end
-end)
-
--- Main attempt handler: only accepts actual source (no srcOverride). Ensures a recent pending attempt exists.
-RegisterNetEvent('jlee-robnpc:server:attempt', function(pedNetId)
+-- Server check: can player use /medic? returns via response event
+RegisterNetEvent('jlee-aimedic:requestUseCheck', function()
     local src = source
-    local Player = QBCore.Functions.GetPlayer(src)
-    if not Player then return end
-
-    debug('attempt called by', src, 'pedNetId=', tostring(pedNetId))
-
-    if not pedNetId then return end
-    pedNetId = tonumber(pedNetId)
-    if not pedNetId then return end
-
-    -- Validate that the client previously told the server it started an attempt for this ped
-    local pending = pendingAttempts[src]
-    if not pending or pending.pedNetId ~= pedNetId then
-        debug('No matching pending attempt for', src, 'expected pedNetId=', pending and pending.pedNetId or 'nil')
-        return
-    end
-    -- allow a short window (e.g., 10 seconds) for the client to finish
-    if os.time() - pending.ts > math.ceil((Config.RobDuration or 7000) / 1000) + 10 then
-        debug('Pending attempt expired for', src)
-        pendingAttempts[src] = nil
-        return
-    end
-    -- consume pending attempt
-    pendingAttempts[src] = nil
-
-    -- enforce configured player cooldown (Config.PlayerCooldown is ms)
-    local pExpires = playerCooldowns[src]
-    if pExpires and pExpires > os.time() then
-        TriggerClientEvent('QBCore:Notify', src, 'You must wait before trying to rob again.', 'error')
+    local ply = QBCore.Functions.GetPlayer(src)
+    if not ply then
+        TriggerClientEvent('jlee-aimedic:responseUseCheck', src, false, 'player_not_found')
         return
     end
 
-    if inCooldown(pedNetId) then
-        TriggerClientEvent('QBCore:Notify', src, 'This person is too shaken up, try someone else', 'error')
-        return
-    end
+    local cid = ply.PlayerData.citizenid or tostring(src)
+    local ambulances = countAmbulanceOnline()
+    local required = Config.RequiredAmbulancesOnline or 1
 
-    -- Police requirement check
-    if Config.UsePoliceRequirement then
-        local cops = countOnlineCops()
-        local req = tonumber(Config.MinPolice) or 1
-        debug('Police check: found', cops, 'required', req)
-        if cops < req then
-            TriggerClientEvent('QBCore:Notify', src, 'Not enough police are online to commit this crime.', 'error')
+    if ambulances >= required then
+        if not (ply.PlayerData.job and ply.PlayerData.job.name == (Config.AmbulanceJobName or 'ambulance')) then
+            TriggerClientEvent('jlee-aimedic:responseUseCheck', src, false, 'ambulance_online_restriction')
             return
         end
     end
 
-    -- Determine attack first. If an attack will occur, do NOT give rewards.
-    local chance = Config.AttackChance or 30 -- percent
-    local willAttack = false
-    if chance == 100 then
-        willAttack = true
-    else
-        local roll = math.random(1,100)
-        debug('Attack roll for', src, '=', roll, 'vs chance', chance)
-        if roll <= chance then willAttack = true end
-    end
-
-    if willAttack then
-        -- notify only the instigator client to make ped attack
-        TriggerClientEvent('jlee-robnpc:client:PedAttack', src, pedNetId, src)
-        debug('Triggered NPC attack for', src, 'pedNetId=', pedNetId)
-        TriggerClientEvent('QBCore:Notify', src, 'The person fought back! No reward.', 'error')
-        -- set ped cooldown and reset counters, but skip any rewards
-        playerRobCounts[src] = 0
-        pedCooldowns[pedNetId] = os.time() + math.floor((Config.PedCooldown or 300000) / 1000)
-        debug('Set cooldown for', pedNetId, 'until', pedCooldowns[pedNetId])
+    local now = os.time()
+    local last = lastMedicUse[cid]
+    local cd = Config.MedicCooldown or Config.Cooldown or 600
+    if last and (now - last) < cd then
+        local remaining = cd - (now - last)
+        TriggerClientEvent('jlee-aimedic:responseUseCheck', src, false, 'cooldown', remaining)
         return
     end
 
-    -- Give rewards server-side (validate server decides amounts)
-    local cashMin = Config.Rewards and Config.Rewards.cash and Config.Rewards.cash.min or 0
-    local cashMax = Config.Rewards and Config.Rewards.cash and Config.Rewards.cash.max or 0
-    if cashMin and cashMax and cashMax >= cashMin then
-        local cash = math.random(cashMin, cashMax)
-        if cash and cash > 0 then
-            local ok, err = pcall(function()
-                Player.Functions.AddMoney('cash', cash, 'robbed-npc')
-            end)
-            if not ok then
-                debug('AddMoney error for', src, err)
-            else
-                debug('Gave cash', cash, 'to', src)
-                TriggerClientEvent('QBCore:Notify', src, 'Found $'..cash, 'success')
-            end
-        end
+    -- rate-limit
+    if not canMakeCall(src, cid) then
+        TriggerClientEvent('jlee-aimedic:responseUseCheck', src, false, 'rate_limited')
+        return
     end
 
-    -- Items (validate amounts and clamp to sane bounds)
-    if Config.Rewards and Config.Rewards.items then
-        for _, item in ipairs(Config.Rewards.items) do
-            if math.random(1,100) <= (item.chance or 0) then
-                local minAmt = math.max(1, tonumber(item.min) or 1)
-                local maxAmt = math.max(minAmt, tonumber(item.max) or minAmt)
-                -- clamp maximum amount to 100 to avoid huge grants
-                maxAmt = math.min(maxAmt, 100)
-                local amt = math.random(minAmt, maxAmt)
-                if amt and amt > 0 then
-                    local added = false
-                    local addErr = nil
-
-                    local ok, ierr = pcall(function()
-                        if Player and Player.Functions and Player.Functions.AddItem then
-                            Player.Functions.AddItem(item.name, amt)
-                            added = true
-                        end
-                    end)
-                    if not ok then addErr = ierr end
-
-                    if not added then
-                        ok, ierr = pcall(function()
-                            if QBCore and QBCore.Functions and QBCore.Functions.AddItem then
-                                QBCore.Functions.AddItem(src, item.name, amt)
-                                added = true
-                            end
-                        end)
-                        if not ok and not addErr then addErr = ierr end
-                    end
-
-                    if not added then
-                        ok, ierr = pcall(function()
-                            if exports and exports['qb-inventory'] and exports['qb-inventory'].AddItem then
-                                exports['qb-inventory'].AddItem(src, item.name, amt)
-                                added = true
-                            end
-                        end)
-                        if not ok and not addErr then addErr = ierr end
-                    end
-
-                    if added then
-                        TriggerClientEvent('QBCore:Notify', src, 'Found '..amt..'x '..item.name, 'success')
-                        debug('Gave item to', src, item.name, amt)
-                    else
-                        debug('AddItem failed for', src, item.name, 'err=', tostring(addErr))
-                    end
-                end
-            else
-                debug('Missed item roll for', src, item.name)
-            end
-        end
-    end
-
-    TriggerClientEvent('jlee-robnpc:client:onRobSuccess', src, pedNetId)
-
-    -- Track consecutive robberies for this player and maybe trigger an NPC attack
-    playerRobCounts[src] = (playerRobCounts[src] or 0) + 1
-    debug('Player', src, 'consecutive robs =', playerRobCounts[src])
-    playerRobCounts[src] = 0
-
-    -- set ped cooldown (Config.PedCooldown is ms -> convert to seconds)
-    pedCooldowns[pedNetId] = os.time() + math.floor((Config.PedCooldown or 300000) / 1000)
-    debug('Set cooldown for', pedNetId, 'until', pedCooldowns[pedNetId])
-
-    -- set player cooldown (use Config.PlayerCooldown ms value)
-    playerCooldowns[src] = os.time() + math.floor((Config.PlayerCooldown or 120000) / 1000)
-    debug('Set player cooldown for', src, 'until', playerCooldowns[src])
+    TriggerClientEvent('jlee-aimedic:responseUseCheck', src, true)
 end)
 
--- Admin/utility: clear cooldown for a ped (restricted to job 'admin')
-RegisterNetEvent('jlee-robnpc:server:clearCooldown', function(pedNetId)
+-- Mark usage (set cooldown) called when player actually requests menu/action
+RegisterNetEvent('jlee-aimedic:markUsed', function()
     local src = source
-    local Player = QBCore.Functions.GetPlayer(src)
-    if not Player then return end
-    local jobName = Player.PlayerData and Player.PlayerData.job and Player.PlayerData.job.name
-    if jobName ~= 'admin' then
-        debug('clearCooldown denied for', src, 'job=', tostring(jobName))
-        return
-    end
-    pedCooldowns[pedNetId] = nil
-    debug('clearCooldown executed by', src, 'for pedNetId', tostring(pedNetId))
+    local ply = QBCore.Functions.GetPlayer(src)
+    if not ply then return end
+    local cid = ply.PlayerData.citizenid or tostring(src)
+    lastMedicUse[cid] = os.time()
 end)
 
--- Optional: provide a server callback to check cooldown
-QBCore.Functions.CreateCallback('jlee-robnpc:server:isPedCooldown', function(source, cb, pedNetId)
-    cb(inCooldown(pedNetId))
-end)
-
--- Server callback to check police requirement and return whether player can rob now
-QBCore.Functions.CreateCallback('jlee-robnpc:server:canRob', function(source, cb)
-    if not Config.UsePoliceRequirement then
-        cb(true)
+-- Request spawn: client asks server to spawn medic/ambulance. Server validates and then triggers client-side spawn.
+RegisterNetEvent('jlee-aimedic:requestSpawn', function(choice, coords)
+    local src = source
+    local ply = QBCore.Functions.GetPlayer(src)
+    if not ply then return end
+    local cid = ply.PlayerData.citizenid or tostring(src)
+    choice = tostring(choice or '')
+    if not (choice == 'npc' or choice == 'ambulance') then
+        TriggerClientEvent('QBCore:Notify', src, 'Invalid spawn request', 'error')
         return
     end
-    local cops = countOnlineCops()
-    local req = tonumber(Config.MinPolice) or 1
-    if cops >= req then
-        cb(true)
+
+    -- enforce max simultaneous medics
+    local activeCount = 0
+    for _, v in pairs(activeCalls) do activeCount = activeCount + 1 end
+    if activeCount >= (Config.MaxSimultaneousMedics or 3) then
+        TriggerClientEvent('QBCore:Notify', src, 'System busy, please try again later', 'error')
+        return
+    end
+
+    -- validate coords if provided (prevent arbitrary far spawns)
+    if coords and type(coords) == 'table' and Config.EnforceMaxCallDistance then
+        -- Server cannot call client natives; try to use player data position if available
+        local valid = true
+        local px, py, pz = nil, nil, nil
+        if ply and ply.PlayerData and ply.PlayerData.position then
+            local pos = ply.PlayerData.position
+            px, py, pz = pos.x or pos[1], pos.y or pos[2], pos.z or pos[3]
+        end
+        if not px then
+            -- Unable to verify distance server-side; reject to be safe
+            TriggerClientEvent('QBCore:Notify', src, 'Unable to verify spawn location server-side', 'error')
+            return
+        end
+        local dx,dy,dz = coords.x - px, coords.y - py, coords.z - pz
+        local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+        if dist > (Config.MaxCallDistance or 100.0) then
+            TriggerClientEvent('QBCore:Notify', src, 'Spawn location too far away', 'error')
+            return
+        end
+    end
+
+    -- whitelist models (safety)
+    if not isModelAllowed(Config.MedicPed, Config.MedicPedFallbacks) and not isModelAllowed(Config.AmbulanceModel, {Config.AmbulanceModel}) then
+        -- no-op: keep compatibility, but ensure strings exist
+    end
+
+    -- create active call record and give it a short expiry, key by citizenid
+    activeCalls[cid] = { source = src, type = choice, timestamp = os.time(), expires = os.time() + (Config.AmbulanceOverallTimeout or 300), billed = false }
+
+    -- trigger client-side spawn (server-initiated) - use client events that the client listens for
+    if choice == 'npc' then
+        TriggerClientEvent('jlee-aimedic:clientCallAIMedic', src, { coords = coords })
+        logEvent(('Player %s (%s) requested NPC medic'):format(ply.PlayerData.citizenid or '-', GetPlayerName(src)))
     else
-        cb(false, ('Not enough police online (%d/%d)'):format(cops, req))
+        TriggerClientEvent('jlee-aimedic:clientCallAmbulance', src, { coords = coords })
+        logEvent(('Player %s (%s) requested AI ambulance'):format(ply.PlayerData.citizenid or '-', GetPlayerName(src)))
     end
 end)
 
--- Backwards-compatible alias: some clients call the event with different casing/name
-RegisterNetEvent('jlee-robnpc:server:AttemptRob', function(pedNetId)
-    -- forward to the main handler using TriggerEvent preserves source when invoked locally
-    -- This alias only triggers the same server handler; do NOT accept external source overrides.
-    TriggerEvent('jlee-robnpc:server:attempt', pedNetId)
+-- Billing: charge player for npc revive or ambulance dropoff.
+-- Only allow billing if player has an active call that matches the type (prevents arbitrary client billing)
+RegisterNetEvent('jlee-aimedic:charge', function(requestedType)
+    local src = source
+    local ply = QBCore.Functions.GetPlayer(src)
+    if not ply then return end
+    local cid = ply.PlayerData.citizenid or tostring(src)
+    local active = activeCalls[cid]
+    if not active or not active.type then
+        TriggerClientEvent('QBCore:Notify', src, 'No active medical call found for billing', 'error')
+        return
+    end
+
+    -- Only allow billing once per active call
+    if active.billed then
+        TriggerClientEvent('QBCore:Notify', src, 'You have already been billed for this call', 'error')
+        return
+    end
+
+    if requestedType ~= active.type then
+        TriggerClientEvent('QBCore:Notify', src, 'Billing type mismatch', 'error')
+        return
+    end
+
+    -- Jobs exempt from billing
+    local exemptJobs = Config.BillingExemptJobs or { (Config.AmbulanceJobName or 'ambulance'), 'police' }
+    local playerJob = ply.PlayerData.job and ply.PlayerData.job.name or ''
+    for _, j in ipairs(exemptJobs) do
+        if tostring(playerJob) == tostring(j) then
+            active.billed = true
+            TriggerClientEvent('QBCore:Notify', src, 'No charge: job exemption applied', 'primary')
+            logEvent(('Skipped billing for player %s (%s) due to job exemption (%s)'):format(cid, GetPlayerName(src), tostring(playerJob)))
+            return
+        end
+    end
+
+    local amount = 0
+    if requestedType == 'npc' then amount = Config.CostNPC or 500
+    elseif requestedType == 'ambulance' then amount = Config.CostAmbulance or 1000 end
+
+    local billed = false
+    if ply.Functions.RemoveMoney('bank', amount) then
+        TriggerClientEvent('QBCore:Notify', src, ('You were billed $%s for medical services (bank).'):format(amount), 'primary')
+        billed = true
+    elseif ply.Functions.RemoveMoney('cash', amount) then
+        TriggerClientEvent('QBCore:Notify', src, ('You were billed $%s for medical services (cash).'):format(amount), 'primary')
+        billed = true
+    end
+
+    if not billed then
+        TriggerClientEvent('QBCore:Notify', src, 'Unable to bill you for medical services (insufficient funds)', 'error')
+    end
+
+    active.billed = true
+    logEvent(('Billed player %s (%s) $%s for %s'):format(cid, GetPlayerName(src), tostring(amount), tostring(requestedType)))
+end)
+
+-- Cleanup active call when player disconnects
+AddEventHandler('playerDropped', function(reason)
+    local src = source
+    -- remove any activeCalls associated with this source
+    for cid, info in pairs(activeCalls) do
+        if info and info.source == src then activeCalls[cid] = nil end
+    end
+end)
+
+-- Server -> client: play revive sound
+RegisterNetEvent('jlee-aimedic:playReviveSoundForPlayer', function()
+    local src = source
+    -- trigger the client event the client actually listens for
+    TriggerClientEvent('jlee-aimedic:client:playReviveSound', src)
+end)
+
+-- Simple server revive logger
+RegisterNetEvent('jlee-aimedic:reviveServer', function(success)
+    local src = source
+    local name = GetPlayerName(src)
+    if success then
+        logEvent(('%s was revived successfully.'):format(name))
+    else
+        logEvent(('%s revival attempt failed.'):format(name))
+    end
+end)
+
+AddEventHandler('onResourceStart', function(res)
+    if res == GetCurrentResourceName() then
+        print('[jlee-aimedic] server.lua loaded (secured)')
+    end
 end)

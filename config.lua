@@ -1,81 +1,79 @@
 Config = {}
 
--- Allowed weapon is fixed to pistol only (cannot be changed)
-Config.AllowedWeapons = { 'weapon_pistol' }
+-- Billing / cost
+-- Billing amounts (separate for NPC revive vs ambulance transport)
+Config.CostNPC = 500 -- charged when NPC medic revives the player
+Config.CostAmbulance = 1000 -- charged when ambulance completes drop-off
 
--- Distance for qb-target interaction
-Config.TargetDistance = 3.0
-Config.TargetLabel = "Rob NPC"
+-- Menu configuration: "qb" for qb-menu, "custom" for NUI
+Config.MenuType = "custom" -- options: "qb", "custom"
 
--- Time (ms) it takes to complete the robbery
-Config.RobDuration = 7000
+-- Job and ambulance availability rules
+Config.AmbulanceJobName = "ambulance"
+Config.RequiredAmbulancesOnline = 1 -- if this many or more are on-duty, only ambulance job can use /medic
 
--- Should the ped raise hands and freeze while robbing
-Config.FreezePed = true
-Config.HandsUpAnim = {
-    dict = 'random@arrests',
-    anim = 'idle_2_hands_up'
-}
+-- Medic ped options
+Config.MedicPed = "s_m_m_paramedic_01"
+Config.MedicPedFallbacks = { "s_m_m_paramedic_01", "u_m_m_joeschmoe" }
 
--- Chance (0-100) that the ped will pull a weapon and attack after being asked (in percent)
--- The ped will always use a pistol when attacking (forced in client). Do not change weapon config.
-Config.AttackChance = 100
-Config.AttackTime = 10000
+-- CPR / timings
+Config.CPRDuration = 15000 -- ms
+Config.ProgressFallbackInterval = 500
 
--- Reward config: cash range (min,max) and item drops (name, min, max, chance%)
-Config.Rewards = {
-    cash = { min = 20, max = 150 },
-    items = {
-        { name = 'bread', chance = 30, min = 1, max = 2 },
-        { name = 'water_bottle', chance = 20, min = 1, max = 1 },
-        { name = 'id_card', chance = 10, min = 1, max = 1 }
-    }
-}
+-- Spawn / approach
+Config.SpawnOffset = vector3(3.0, 0.0, 0.0)
+Config.FindRadius = 5.0
+Config.MedicApproachDistance = 2.0
+Config.MedicApproachTimeout = 8000
 
--- Ped cooldown (ms) to prevent repeated robs on the same ped
-Config.PedCooldown = 300000 -- 5 minutes
-
--- Player cooldown (ms) to prevent repeated robberies by the same player
--- Server enforces a 2 minute cooldown regardless of client attempts
-Config.PlayerCooldown = 120000 -- 2 minutes
-
--- Ped models that are blacklisted from being robbed (optional)
-Config.PedBlacklist = {
-    -- 's_m_y_cop_01', 's_f_y_cop_01'
-}
-
--- Use progressbar resource if available (set false will use simple wait)
-Config.UseProgressBar = true
-
--- Enable debug prints
+-- Limits / debugging
+Config.Prefix = "[AI Medic]"
+-- legacy: keep for backward compatibility
+Config.Cooldown = 600
+Config.MedicCooldown = 600 -- seconds, default 10 minutes
 Config.Debug = true
+Config.MaxSimultaneousMedics = 3
+Config.BypassJobs = { "ambulance", "police" }
 
--- Police / PD count requirements
--- Enable checking for minimum police online to allow robbing
-Config.UsePoliceRequirement = true
--- Minimum number of cops required online (inclusive)
-Config.MinPolice = 1
--- Which job name to treat as police (adjust to your server's job identifier)
-Config.PoliceJobName = 'police'
--- Require cops to be on-duty to count? (some servers track job.onduty)
-Config.RequirePoliceOnDuty = true
+-- Jobs exempt from billing (no charge when using NPC or ambulance)
+Config.BillingExemptJobs = { Config.AmbulanceJobName, "police" }
 
--- Weapon given to ped if they decide to fight is deprecated and ignored; ped will use pistol only.
+-- Logging / webhooks
+Config.EnableLogging = true
+Config.EnableFileLogging = false
+Config.WebhookURL = ""
 
--- Dispatch/Alert settings
--- Enable sending a dispatch alert to police when a robbery starts
-Config.EnableDispatch = true
--- By default the resource uses the built-in internal dispatch system.
--- To enable external dispatch integration set Config.ExternalDispatch = 'ps-dispatch'.
--- By default the resource uses the built-in internal dispatch system (no external dispatch).
--- Set Config.ExternalDispatch = 'ps-dispatch' to use ps-dispatch instead of the internal dispatcher.
-Config.ExternalDispatch = 'none'
+-- Heartbeat sound configuration (used during revive)
+Config.HeartbeatSoundName = 'Beep_Red'
+Config.HeartbeatSoundSet = 'DLC_HEIST_HACKING_SNAKE_SOUNDS'
+Config.HeartbeatInterval = 1000 -- ms between beats
+Config.UseSoundFallbacks = true -- try alternate playback methods
 
--- Blip settings for client police alerts (when using built-in dispatch blip)
-Config.DispatchBlip = { sprite = 161, color = 1, scale = 1.2 }
--- How long (ms) the blip should remain for police clients
-Config.DispatchBlipTime = 180000 -- 3 minutes
+-- Ambulance arrival song (MP3 resource name, lowercase)
+Config.AmbulanceArrivalSong = 'medic_song'
+Config.AmbulanceArrivalSongSet = '' -- optional soundset, leave empty for frontend fallback
 
--- Job name used to identify police players (already defined above but keep explicit here)
-Config.PoliceJobName = Config.PoliceJobName or 'police'
+-- Call rules
+Config.AllowCallWhenNotMarkedDown = false
+Config.MaxCallDistance = 100.0
+Config.EnforceMaxCallDistance = false
+Config.BlockWhenInVehicle = true
+Config.BlockWhenSpectating = true
+Config.MaxConcurrentCallsPerTarget = 1
+Config.CallerRateWindow = 60
+Config.CallerMaxCallsPerWindow = 3
+Config.PaymentMethods = { 'bank', 'cash' }
 
+-- Ambulance AI settings
+Config.AmbulanceModel = 'ambulance'
+Config.DriverModel = 's_m_m_paramedic_01'
+Config.AmbulanceDropOff1 = vector3(292.45, -582.97, 43.19)
+Config.AmbulanceDropOff2 = vector3(315.77, -591.50, 43.19)
+Config.AmbulanceStuckTimeout = 120 -- seconds before considered stuck
+Config.AmbulanceOverallTimeout = 300 -- seconds overall timeout before fallback
+Config.SpawnDistance = 30.0
+Config.PickupRadius = 4.5
+Config.SeatIndices = {2,1,0}
+Config.AmbulancePostPickupLife = 10000 -- ms after pickup before driving to dropoff1 (shortened to ~10s)
+Config.AmbulanceAfterDropoff2Life = 20000 -- ms after final dropoff before cleanup
+return Config

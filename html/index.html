@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Jlee-Npcmedic UI</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Open+Sans&display=swap');
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  font-family: 'Open Sans', sans-serif;
+  background-color: transparent !important; /* force full transparency */
+  overflow: hidden;
+  -webkit-backface-visibility: hidden;
+  -webkit-transform: translateZ(0);
+}
+
+/* Full-screen overlay used only when UI is open */
+.overlay {
+  position: fixed;
+  inset: 0;
+  display: none; /* hidden until openMedicUI */
+  justify-content: center;
+  align-items: center;
+  background: rgba(0,0,0,0.0); /* transparent by default, JS will set visible alpha */
+  z-index: 2000;
+  opacity: 0;
+  transition: opacity 0.25s ease-in-out;
+}
+
+/* Panel styling */
+.panel {
+  background: rgba(15, 15, 15, 0.95);
+  border: 2px solid #C5FF00;
+  box-shadow: 0 0 25px #C5FF00;
+  border-radius: 16px;
+  padding: 40px 50px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  z-index: 2100;
+  color: white;
+  min-width: 300px;
+  min-height: 200px;
+  animation: glowPulse 2s infinite;
+}
+
+@keyframes glowPulse {
+  0%, 100% { box-shadow: 0 0 20px #C5FF00; }
+  50% { box-shadow: 0 0 35px #C5FF00; }
+}
+
+.panel h1 { color: #C5FF00; font-size: 1.5em; margin-bottom: 25px; text-shadow: 0 0 10px #C5FF00; }
+
+.button { background: white; border: none; color: #0a0a0a; padding: 12px 22px; margin: 8px; border-radius: 10px; font-size: 1.1em; display: flex; align-items: center; gap: 8px; cursor: pointer; transition: all 0.3s; box-shadow: 0 0 10px #fff; }
+.button:hover { transform: scale(1.08); box-shadow: 0 0 20px #C5FF00; background: #C5FF00; }
+
+#closeBtn { position: fixed; top: 25px; right: 50px; font-size: 28px; color: white; cursor: pointer; text-shadow: 0 0 10px #C5FF00; z-index: 2200; display: none; }
+</style>
+</head>
+<body>
+  <div class="overlay" id="overlay">
+    <div class="panel" id="medicMenu">
+      <h1>Medic Assistance</h1>
+      <div class="button" id="npcBtn">👨‍⚕️ Call NPC Medic</div>
+      <div class="button" id="ambBtn">🚑 Call Ambulance</div>
+    </div>
+  </div>
+  <div id="closeBtn">✖</div>
+
+  <audio id="medicSong" src="sounds/medic_song.mp3" loop preload="auto"></audio>
+
+<script>
+console.log('[Jlee-Npcmedic] HTML loaded in NUI');
+
+const overlay = document.getElementById('overlay');
+const closeBtn = document.getElementById('closeBtn');
+
+function showUI() {
+  overlay.style.background = 'rgba(0,0,0,0.65)';
+  overlay.style.display = 'flex';
+  closeBtn.style.display = 'block';
+  requestAnimationFrame(() => { overlay.style.opacity = '1'; });
+}
+
+function hideUI() {
+  overlay.style.opacity = '0';
+  overlay.style.background = 'rgba(0,0,0,0.0)';
+  closeBtn.style.display = 'none';
+  setTimeout(() => { overlay.style.display = 'none'; }, 250);
+}
+
+// ensure UI is hidden on load to avoid any default rendering
+hideUI();
+
+window.addEventListener('message', (event) => {
+  const data = event.data;
+  if (!data) return;
+  if (data.action === 'openMedicUI') showUI();
+  if (data.action === 'closeMedicUI') hideUI();
+  if (data.action === 'playMedicSong') {
+    const audio = document.getElementById('medicSong');
+    if (audio) { audio.src = data.name || audio.src; audio.play().catch(e => console.log('Medic audio play failed', e)); }
+  }
+  if (data.action === 'stopMedicSong') {
+    const audio = document.getElementById('medicSong');
+    if (audio) { audio.pause(); audio.currentTime = 0; }
+  }
+});
+
+// NUI callbacks use Fetch to parent resource endpoints
+function postAction(endpoint, payload) {
+  fetch(`https://${GetParentResourceName()}/${endpoint}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }).catch(e=>console.log('NUI post failed', e));
+}
+
+document.getElementById('npcBtn').onclick = () => { postAction('chooseOption', { option: 'npc' }); };
+document.getElementById('ambBtn').onclick = () => { postAction('chooseOption', { option: 'ambulance' }); };
+closeBtn.onclick = () => { postAction('close', {}); };
+</script>
+</body>
+</html>

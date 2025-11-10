@@ -1,24 +1,17 @@
 fx_version 'cerulean'
-games { 'gta5' }
+game 'gta5'
 
-author 'BLDR Team'
-description 'Rob any NPC - QBCore (qb-target + qb-inventory compatible)'
+author 'Jlee-NpcMedic'
+description 'NPC Medic and Ambulance AI with working MP3 NUI audio'
 version '1.0.0'
 
-lua54 'yes'
-
+client_script 'client.lua'
+server_script 'server.lua'
 shared_script 'config.lua'
 
-client_scripts {
-    'client.lua'
-}
+ui_page 'html/index.html'
 
-server_scripts {
-    'server.lua'
-}
-
-dependencies {
-    'qb-core',
-    'qb-target',
-    'qb-inventory'
+files {
+    'html/index.html',
+    'html/sounds/medic_song.mp3'
 }
